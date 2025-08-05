@@ -247,7 +247,7 @@ type HandlerFunc func(ctx context.Context, req *JSONRPCRequest) (interface{}, er
 // NewServer creates a new MCP server instance
 func NewServer(config ServerConfig) *Server {
 	if config.ProtocolVersion == "" {
-		config.ProtocolVersion = "0.1.0"
+		config.ProtocolVersion = "2025-06-18" // Updated to match Claude's version
 	}
 	if config.Input == nil {
 		config.Input = os.Stdin
@@ -372,7 +372,15 @@ func (s *Server) Start() error {
 	s.config.Logger.Info("MCP Server started", "name", s.config.Name, "version", s.config.Version)
 
 	scanner := bufio.NewScanner(s.reader)
-	for scanner.Scan() && s.running {
+	// Set a larger buffer for scanner to handle large messages
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		if !s.running {
+			break
+		}
+
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue // Skip empty lines
@@ -389,9 +397,14 @@ func (s *Server) Start() error {
 		s.handleRequest(ctx, &req)
 	}
 
-	if err := scanner.Err(); err != nil && err != io.EOF {
+	// Check if we stopped due to EOF or an actual error
+	if err := scanner.Err(); err != nil {
 		s.config.Logger.Error("Scanner error", "error", err)
+		return err
 	}
+
+	// Normal EOF - not an error for MCP servers
+	s.config.Logger.Info("Input stream closed, shutting down gracefully")
 
 	if s.onShutdown != nil {
 		return s.onShutdown()
