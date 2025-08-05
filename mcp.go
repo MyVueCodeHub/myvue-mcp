@@ -371,24 +371,26 @@ func (s *Server) Start() error {
 
 	s.config.Logger.Info("MCP Server started", "name", s.config.Name, "version", s.config.Version)
 
-	for s.running {
-		line, err := s.reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			s.config.Logger.Error("Failed to read request", "error", err)
-			continue
+	scanner := bufio.NewScanner(s.reader)
+	for scanner.Scan() && s.running {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue // Skip empty lines
 		}
 
 		var req JSONRPCRequest
 		if err := json.Unmarshal(line, &req); err != nil {
+			s.config.Logger.Error("Failed to parse request", "error", err, "line", string(line))
 			s.sendError(nil, -32700, "Parse error", nil)
 			continue
 		}
 
 		ctx := context.Background()
 		s.handleRequest(ctx, &req)
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		s.config.Logger.Error("Scanner error", "error", err)
 	}
 
 	if s.onShutdown != nil {
