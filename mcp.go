@@ -735,6 +735,15 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// IMPORTANT: Handle notifications (requests without an id)
+	// Notifications don't get responses according to JSON-RPC spec
+	if req.ID == nil && req.Method == "notifications/initialized" {
+		// This is the initialized notification - just acknowledge it
+		s.config.Logger.Info("Received initialized notification")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	ctx := r.Context()
 
 	// Add principal to context if authenticated
