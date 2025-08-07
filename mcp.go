@@ -676,6 +676,8 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 // HTTP Request Handling
 // ============================================================================
 
+// Replace your handleHTTPRequest method in mcp.go with this version:
+
 func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	// Check authentication if configured
 	if s.authProvider != nil {
@@ -735,14 +737,26 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// IMPORTANT: Handle notifications (requests without an id)
-	// Notifications don't get responses according to JSON-RPC spec
-	if req.ID == nil && req.Method == "notifications/initialized" {
-		// This is the initialized notification - just acknowledge it
-		s.config.Logger.Info("Received initialized notification")
+	// ===== IMPORTANT FIX: Handle notifications properly =====
+	// Notifications are JSON-RPC messages without an ID
+	// They should not receive a response according to the spec
+	if req.ID == nil {
+		s.config.Logger.Info("Received notification", "method", req.Method)
+
+		// Handle specific notifications
+		switch req.Method {
+		case "notifications/initialized":
+			// Client is confirming initialization is complete
+			s.config.Logger.Info("Client initialization complete")
+		default:
+			s.config.Logger.Info("Unknown notification", "method", req.Method)
+		}
+
+		// For notifications, we just return 200 OK with no body
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	// ===== END OF FIX =====
 
 	ctx := r.Context()
 
