@@ -1,14 +1,15 @@
-// Package mcp provides a framework for building Model Context Protocol servers
+// Package mcp provides a framework for building Model Context Protocol servers with HTTP transport
 package mcp
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
 )
 
 // ============================================================================
@@ -87,7 +88,6 @@ type ServerInfo struct {
 // Tool System
 // ============================================================================
 
-// Tool represents an executable tool in the MCP server
 type Tool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description,omitempty"`
@@ -95,15 +95,13 @@ type Tool struct {
 	handler     ToolHandler
 }
 
-// InputSchema defines the JSON schema for tool inputs
 type InputSchema struct {
 	Type       string              `json:"type"`
 	Properties map[string]Property `json:"properties,omitempty"`
 	Required   []string            `json:"required,omitempty"`
-	Raw        json.RawMessage     `json:"-"` // For custom schemas
+	Raw        json.RawMessage     `json:"-"`
 }
 
-// Property defines a single property in an input schema
 type Property struct {
 	Type        string        `json:"type"`
 	Description string        `json:"description,omitempty"`
@@ -111,7 +109,6 @@ type Property struct {
 	Enum        []interface{} `json:"enum,omitempty"`
 }
 
-// MarshalJSON handles both structured and raw schemas
 func (i InputSchema) MarshalJSON() ([]byte, error) {
 	if i.Raw != nil {
 		return i.Raw, nil
@@ -120,15 +117,12 @@ func (i InputSchema) MarshalJSON() ([]byte, error) {
 	return json.Marshal(Alias(i))
 }
 
-// ToolHandler is the function signature for tool implementations
 type ToolHandler func(ctx context.Context, args map[string]interface{}) (*ToolResult, error)
 
-// ToolResult represents the result of a tool execution
 type ToolResult struct {
 	Content []Content `json:"content"`
 }
 
-// Content represents a piece of content returned by a tool
 type Content struct {
 	Type     string      `json:"type"`
 	Text     string      `json:"text,omitempty"`
@@ -140,7 +134,6 @@ type Content struct {
 // Resource System
 // ============================================================================
 
-// Resource represents a data resource in the MCP server
 type Resource struct {
 	URI         string `json:"uri"`
 	Name        string `json:"name"`
@@ -149,10 +142,8 @@ type Resource struct {
 	handler     ResourceHandler
 }
 
-// ResourceHandler retrieves resource content
 type ResourceHandler func(ctx context.Context, uri string) (*ResourceContent, error)
 
-// ResourceContent represents the content of a resource
 type ResourceContent struct {
 	URI      string    `json:"uri"`
 	MimeType string    `json:"mimeType,omitempty"`
@@ -163,7 +154,6 @@ type ResourceContent struct {
 // Prompt System
 // ============================================================================
 
-// Prompt represents a reusable prompt template
 type Prompt struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description,omitempty"`
@@ -171,44 +161,226 @@ type Prompt struct {
 	handler     PromptHandler
 }
 
-// PromptArg defines an argument for a prompt template
 type PromptArg struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Required    bool   `json:"required,omitempty"`
 }
 
-// PromptHandler generates prompt content
 type PromptHandler func(ctx context.Context, args map[string]string) (*PromptResult, error)
 
-// PromptResult represents the result of prompt generation
 type PromptResult struct {
 	Description string          `json:"description,omitempty"`
 	Messages    []PromptMessage `json:"messages"`
 }
 
-// PromptMessage represents a message in a prompt
 type PromptMessage struct {
 	Role    string  `json:"role"`
 	Content Content `json:"content"`
 }
 
 // ============================================================================
-// Server Implementation
+// Authentication System
 // ============================================================================
 
-// Server represents an MCP server instance
-type Server struct {
-	config    ServerConfig
+// AuthProvider defines the interface for authentication
+type AuthProvider interface {
+	// Authenticate validates the request and returns whether it's authorized
+	Authenticate(r *http.Request) (bool, error)
+	// GetPrincipal returns the authenticated principal (user/client) if any
+	GetPrincipal(r *http.Request) (string, error)
+}
+
+// TokenAuthProvider implements token-based authentication
+type TokenAuthProvider struct {
+	tokens map[string]string // token -> principal mapping
+	mu     sync.RWMutex
+}
+
+func NewTokenAuthProvider() *TokenAuthProvider {
+	return &TokenAuthProvider{
+		tokens: make(map[string]string),
+	}
+}
+
+func (t *TokenAuthProvider) AddToken(token, principal string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.tokens[token] = principal
+}
+
+func (t *TokenAuthProvider) RemoveToken(token string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.tokens, token)
+}
+
+func (t *TokenAuthProvider) Authenticate(r *http.Request) (bool, error) {
+	token := t.extractToken(r)
+	if token == "" {
+		return false, nil
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, exists := t.tokens[token]
+	return exists, nil
+}
+
+func (t *TokenAuthProvider) GetPrincipal(r *http.Request) (string, error) {
+	token := t.extractToken(r)
+	if token == "" {
+		return "", fmt.Errorf("no token found")
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	principal, exists := t.tokens[token]
+	if !exists {
+		return "", fmt.Errorf("invalid token")
+	}
+	return principal, nil
+}
+
+func (t *TokenAuthProvider) extractToken(r *http.Request) string {
+	// Check Authorization header
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+
+	// Check query parameter as fallback
+	return r.URL.Query().Get("token")
+}
+
+// APIKeyAuthProvider implements API key authentication
+type APIKeyAuthProvider struct {
+	apiKeys map[string]string // apiKey -> principal mapping
+	header  string            // header name to check (default: X-API-Key)
+	mu      sync.RWMutex
+}
+
+func NewAPIKeyAuthProvider(headerName string) *APIKeyAuthProvider {
+	if headerName == "" {
+		headerName = "X-API-Key"
+	}
+	return &APIKeyAuthProvider{
+		apiKeys: make(map[string]string),
+		header:  headerName,
+	}
+}
+
+func (a *APIKeyAuthProvider) AddAPIKey(key, principal string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.apiKeys[key] = principal
+}
+
+func (a *APIKeyAuthProvider) Authenticate(r *http.Request) (bool, error) {
+	key := r.Header.Get(a.header)
+	if key == "" {
+		return false, nil
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	_, exists := a.apiKeys[key]
+	return exists, nil
+}
+
+func (a *APIKeyAuthProvider) GetPrincipal(r *http.Request) (string, error) {
+	key := r.Header.Get(a.header)
+	if key == "" {
+		return "", fmt.Errorf("no API key found")
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	principal, exists := a.apiKeys[key]
+	if !exists {
+		return "", fmt.Errorf("invalid API key")
+	}
+	return principal, nil
+}
+
+// ============================================================================
+// URL Whitelist
+// ============================================================================
+
+// URLWhitelist manages allowed origins and referers
+type URLWhitelist struct {
+	allowedOrigins  map[string]bool
+	allowedPatterns []string
+	mu              sync.RWMutex
+}
+
+func NewURLWhitelist() *URLWhitelist {
+	return &URLWhitelist{
+		allowedOrigins:  make(map[string]bool),
+		allowedPatterns: []string{},
+	}
+}
+
+func (w *URLWhitelist) AddOrigin(origin string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.allowedOrigins[origin] = true
+}
+
+func (w *URLWhitelist) AddPattern(pattern string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.allowedPatterns = append(w.allowedPatterns, pattern)
+}
+
+func (w *URLWhitelist) IsAllowed(origin string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	// Check exact match
+	if w.allowedOrigins[origin] {
+		return true
+	}
+
+	// Check patterns
+	for _, pattern := range w.allowedPatterns {
+		if matched := matchPattern(pattern, origin); matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+func matchPattern(pattern, origin string) bool {
+	// Simple wildcard matching (e.g., "https://*.claude.ai")
+	if strings.Contains(pattern, "*") {
+		parts := strings.Split(pattern, "*")
+		if len(parts) == 2 {
+			return strings.HasPrefix(origin, parts[0]) && strings.HasSuffix(origin, parts[1])
+		}
+	}
+	return pattern == origin
+}
+
+// ============================================================================
+// HTTP Server Implementation
+// ============================================================================
+
+// HTTPServer represents an HTTP-based MCP server
+type HTTPServer struct {
+	config    HTTPServerConfig
 	tools     map[string]*Tool
 	resources map[string]*Resource
 	prompts   map[string]*Prompt
 
-	reader *bufio.Reader
-	writer *bufio.Writer
-
 	mu      sync.RWMutex
 	running bool
+	server  *http.Server
+
+	// Authentication
+	authProvider AuthProvider
+	whitelist    *URLWhitelist
 
 	// Hooks for lifecycle events
 	onInit     func(*InitializeParams) error
@@ -216,20 +388,49 @@ type Server struct {
 
 	// Middleware
 	middleware []Middleware
+
+	// Session management
+	sessions map[string]*Session
+	sessmu   sync.RWMutex
 }
 
-// ServerConfig holds server configuration
-type ServerConfig struct {
+// HTTPServerConfig holds HTTP server configuration
+type HTTPServerConfig struct {
 	Name            string
 	Version         string
 	ProtocolVersion string
 
-	// Custom IO (defaults to stdin/stdout)
-	Input  io.Reader
-	Output io.Writer
+	// HTTP settings
+	Host string
+	Port int
+	Path string // Base path for MCP endpoints (default: "/mcp")
+
+	// TLS settings
+	TLSCert string
+	TLSKey  string
+
+	// Timeouts
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+
+	// CORS settings
+	EnableCORS       bool
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	AllowCredentials bool
 
 	// Logging
 	Logger Logger
+}
+
+// Session represents a client session
+type Session struct {
+	ID        string
+	Principal string
+	StartTime time.Time
+	LastSeen  time.Time
+	Data      map[string]interface{}
 }
 
 // Logger interface for custom logging
@@ -244,37 +445,52 @@ type Middleware func(next HandlerFunc) HandlerFunc
 
 type HandlerFunc func(ctx context.Context, req *JSONRPCRequest) (interface{}, error)
 
-// NewServer creates a new MCP server instance
-func NewServer(config ServerConfig) *Server {
+// NewHTTPServer creates a new HTTP-based MCP server
+func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
 	if config.ProtocolVersion == "" {
-		config.ProtocolVersion = "2025-06-18" // Updated to match Claude's version
+		config.ProtocolVersion = "2025-06-18"
 	}
-	if config.Input == nil {
-		config.Input = os.Stdin
+	if config.Path == "" {
+		config.Path = "/mcp"
 	}
-	if config.Output == nil {
-		config.Output = os.Stdout
+	if config.Port == 0 {
+		config.Port = 3000
 	}
 	if config.Logger == nil {
 		config.Logger = &defaultLogger{}
 	}
+	if config.ReadTimeout == 0 {
+		config.ReadTimeout = 30 * time.Second
+	}
+	if config.WriteTimeout == 0 {
+		config.WriteTimeout = 30 * time.Second
+	}
 
-	return &Server{
+	return &HTTPServer{
 		config:    config,
 		tools:     make(map[string]*Tool),
 		resources: make(map[string]*Resource),
 		prompts:   make(map[string]*Prompt),
-		reader:    bufio.NewReader(config.Input),
-		writer:    bufio.NewWriter(config.Output),
+		sessions:  make(map[string]*Session),
+		whitelist: NewURLWhitelist(),
 	}
 }
 
+// SetAuthProvider sets the authentication provider
+func (s *HTTPServer) SetAuthProvider(provider AuthProvider) {
+	s.authProvider = provider
+}
+
+// SetURLWhitelist sets the URL whitelist
+func (s *HTTPServer) SetURLWhitelist(whitelist *URLWhitelist) {
+	s.whitelist = whitelist
+}
+
 // ============================================================================
-// Registration Methods
+// Registration Methods (same as before)
 // ============================================================================
 
-// RegisterTool adds a tool to the server
-func (s *Server) RegisterTool(name, description string, schema InputSchema, handler ToolHandler) error {
+func (s *HTTPServer) RegisterTool(name, description string, schema InputSchema, handler ToolHandler) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -292,8 +508,7 @@ func (s *Server) RegisterTool(name, description string, schema InputSchema, hand
 	return nil
 }
 
-// RegisterSimpleTool provides a simplified way to register tools
-func (s *Server) RegisterSimpleTool(name, description string, handler ToolHandler) error {
+func (s *HTTPServer) RegisterSimpleTool(name, description string, handler ToolHandler) error {
 	schema := InputSchema{
 		Type:       "object",
 		Properties: map[string]Property{},
@@ -301,8 +516,7 @@ func (s *Server) RegisterSimpleTool(name, description string, handler ToolHandle
 	return s.RegisterTool(name, description, schema, handler)
 }
 
-// RegisterResource adds a resource to the server
-func (s *Server) RegisterResource(uri, name, description, mimeType string, handler ResourceHandler) error {
+func (s *HTTPServer) RegisterResource(uri, name, description, mimeType string, handler ResourceHandler) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -321,8 +535,7 @@ func (s *Server) RegisterResource(uri, name, description, mimeType string, handl
 	return nil
 }
 
-// RegisterPrompt adds a prompt template to the server
-func (s *Server) RegisterPrompt(name, description string, args []PromptArg, handler PromptHandler) error {
+func (s *HTTPServer) RegisterPrompt(name, description string, args []PromptArg, handler PromptHandler) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -340,27 +553,24 @@ func (s *Server) RegisterPrompt(name, description string, args []PromptArg, hand
 	return nil
 }
 
-// Use adds middleware to the server
-func (s *Server) Use(m Middleware) {
+func (s *HTTPServer) Use(m Middleware) {
 	s.middleware = append(s.middleware, m)
 }
 
-// OnInitialize sets a callback for initialization
-func (s *Server) OnInitialize(handler func(*InitializeParams) error) {
+func (s *HTTPServer) OnInitialize(handler func(*InitializeParams) error) {
 	s.onInit = handler
 }
 
-// OnShutdown sets a callback for shutdown
-func (s *Server) OnShutdown(handler func() error) {
+func (s *HTTPServer) OnShutdown(handler func() error) {
 	s.onShutdown = handler
 }
 
 // ============================================================================
-// Server Runtime
+// HTTP Server Runtime
 // ============================================================================
 
-// Start begins listening for and processing requests
-func (s *Server) Start() error {
+// Start begins the HTTP server
+func (s *HTTPServer) Start() error {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
@@ -369,52 +579,49 @@ func (s *Server) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
-	s.config.Logger.Info("MCP Server started", "name", s.config.Name, "version", s.config.Version)
+	mux := http.NewServeMux()
 
-	scanner := bufio.NewScanner(s.reader)
-	// Set a larger buffer for scanner to handle large messages
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	// Register MCP endpoint
+	mux.HandleFunc(s.config.Path, s.handleHTTPRequest)
 
-	for scanner.Scan() {
-		if !s.running {
-			break
-		}
+	// Register SSE endpoint for server-sent events (if needed)
+	mux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
 
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue // Skip empty lines
-		}
+	// Health check endpoint
+	mux.HandleFunc("/health", s.handleHealth)
 
-		var req JSONRPCRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			s.config.Logger.Error("Failed to parse request", "error", err, "line", string(line))
-			s.sendError(nil, -32700, "Parse error", nil)
-			continue
-		}
-
-		ctx := context.Background()
-		s.handleRequest(ctx, &req)
+	// Wrap with CORS if enabled
+	var handler http.Handler = mux
+	if s.config.EnableCORS {
+		handler = s.corsMiddleware(handler)
 	}
 
-	// Check if we stopped due to EOF or an actual error
-	if err := scanner.Err(); err != nil {
-		s.config.Logger.Error("Scanner error", "error", err)
+	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	s.server = &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  s.config.ReadTimeout,
+		WriteTimeout: s.config.WriteTimeout,
+	}
+
+	s.config.Logger.Info("HTTP MCP Server started", "address", addr, "path", s.config.Path)
+
+	var err error
+	if s.config.TLSCert != "" && s.config.TLSKey != "" {
+		err = s.server.ListenAndServeTLS(s.config.TLSCert, s.config.TLSKey)
+	} else {
+		err = s.server.ListenAndServe()
+	}
+
+	if err != nil && err != http.ErrServerClosed {
 		return err
-	}
-
-	// Normal EOF - not an error for MCP servers
-	s.config.Logger.Info("Input stream closed, shutting down gracefully")
-
-	if s.onShutdown != nil {
-		return s.onShutdown()
 	}
 
 	return nil
 }
 
 // Stop gracefully shuts down the server
-func (s *Server) Stop() error {
+func (s *HTTPServer) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -423,14 +630,135 @@ func (s *Server) Stop() error {
 	}
 
 	s.running = false
-	return nil
+
+	if s.onShutdown != nil {
+		if err := s.onShutdown(); err != nil {
+			s.config.Logger.Error("Shutdown hook failed", "error", err)
+		}
+	}
+
+	return s.server.Shutdown(ctx)
 }
 
 // ============================================================================
-// Request Handling
+// HTTP Request Handling
 // ============================================================================
 
-func (s *Server) handleRequest(ctx context.Context, req *JSONRPCRequest) {
+func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	// Check authentication if configured
+	if s.authProvider != nil {
+		authenticated, err := s.authProvider.Authenticate(r)
+		if err != nil {
+			s.config.Logger.Error("Authentication error", "error", err)
+			http.Error(w, "Authentication error", http.StatusInternalServerError)
+			return
+		}
+		if !authenticated {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// Check URL whitelist if configured
+	origin := r.Header.Get("Origin")
+	if origin != "" && s.whitelist != nil && len(s.whitelist.allowedOrigins) > 0 {
+		if !s.whitelist.IsAllowed(origin) {
+			http.Error(w, "Origin not allowed", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Handle preflight requests
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Only accept POST requests for JSON-RPC
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.config.Logger.Error("Failed to read request body", "error", err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Handle batch requests
+	if len(body) > 0 && body[0] == '[' {
+		s.handleBatchRequest(w, r, body)
+		return
+	}
+
+	// Handle single request
+	var req JSONRPCRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.config.Logger.Error("Failed to parse request", "error", err)
+		s.sendHTTPError(w, nil, -32700, "Parse error", nil)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Add principal to context if authenticated
+	if s.authProvider != nil {
+		if principal, err := s.authProvider.GetPrincipal(r); err == nil {
+			ctx = context.WithValue(ctx, "principal", principal)
+		}
+	}
+
+	result, rpcErr := s.handleRequest(ctx, &req)
+
+	// Send response
+	resp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+	}
+
+	if rpcErr != nil {
+		resp.Error = rpcErr
+	} else {
+		resp.Result = result
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *HTTPServer) handleBatchRequest(w http.ResponseWriter, r *http.Request, body []byte) {
+	var requests []JSONRPCRequest
+	if err := json.Unmarshal(body, &requests); err != nil {
+		s.sendHTTPError(w, nil, -32700, "Parse error", nil)
+		return
+	}
+
+	responses := make([]JSONRPCResponse, 0, len(requests))
+	ctx := r.Context()
+
+	for _, req := range requests {
+		result, rpcErr := s.handleRequest(ctx, &req)
+		resp := JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+		}
+		if rpcErr != nil {
+			resp.Error = rpcErr
+		} else {
+			resp.Result = result
+		}
+		responses = append(responses, resp)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(responses)
+}
+
+func (s *HTTPServer) handleRequest(ctx context.Context, req *JSONRPCRequest) (interface{}, *RPCError) {
 	handler := s.getHandler(req.Method)
 
 	// Apply middleware
@@ -441,17 +769,97 @@ func (s *Server) handleRequest(ctx context.Context, req *JSONRPCRequest) {
 	result, err := handler(ctx, req)
 	if err != nil {
 		if rpcErr, ok := err.(*RPCError); ok {
-			s.sendError(req.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
-		} else {
-			s.sendError(req.ID, -32603, err.Error(), nil)
+			return nil, rpcErr
 		}
-		return
+		return nil, &RPCError{Code: -32603, Message: err.Error()}
 	}
 
-	s.sendResult(req.ID, result)
+	return result, nil
 }
 
-func (s *Server) getHandler(method string) HandlerFunc {
+func (s *HTTPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// Set headers for SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// TODO: Implement SSE for notifications/events
+	// This would be used for list_changed events
+}
+
+func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	status := map[string]interface{}{
+		"status": "healthy",
+		"server": map[string]interface{}{
+			"name":    s.config.Name,
+			"version": s.config.Version,
+		},
+		"capabilities": map[string]interface{}{
+			"tools":     len(s.tools),
+			"resources": len(s.resources),
+			"prompts":   len(s.prompts),
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func (s *HTTPServer) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers
+		if len(s.config.AllowedOrigins) > 0 {
+			origin := r.Header.Get("Origin")
+			for _, allowed := range s.config.AllowedOrigins {
+				if allowed == "*" || allowed == origin {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					break
+				}
+			}
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+
+		if len(s.config.AllowedMethods) > 0 {
+			w.Header().Set("Access-Control-Allow-Methods", strings.Join(s.config.AllowedMethods, ", "))
+		} else {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		}
+
+		if len(s.config.AllowedHeaders) > 0 {
+			w.Header().Set("Access-Control-Allow-Headers", strings.Join(s.config.AllowedHeaders, ", "))
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
+
+		if s.config.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *HTTPServer) sendHTTPError(w http.ResponseWriter, id interface{}, code int, message string, data interface{}) {
+	resp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &RPCError{
+			Code:    code,
+			Message: message,
+			Data:    data,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// ============================================================================
+// Request Handlers (same as before with minor adjustments)
+// ============================================================================
+
+func (s *HTTPServer) getHandler(method string) HandlerFunc {
 	switch method {
 	case "initialize":
 		return s.handleInitialize
@@ -474,7 +882,7 @@ func (s *Server) getHandler(method string) HandlerFunc {
 	}
 }
 
-func (s *Server) handleInitialize(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handleInitialize(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	var params InitializeParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return nil, &RPCError{Code: -32602, Message: "Invalid params"}
@@ -508,7 +916,7 @@ func (s *Server) handleInitialize(ctx context.Context, req *JSONRPCRequest) (int
 	}, nil
 }
 
-func (s *Server) handleToolsList(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handleToolsList(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -524,7 +932,7 @@ func (s *Server) handleToolsList(ctx context.Context, req *JSONRPCRequest) (inte
 	return map[string]interface{}{"tools": tools}, nil
 }
 
-func (s *Server) handleToolCall(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handleToolCall(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	var params struct {
 		Name      string                 `json:"name"`
 		Arguments map[string]interface{} `json:"arguments"`
@@ -550,7 +958,7 @@ func (s *Server) handleToolCall(ctx context.Context, req *JSONRPCRequest) (inter
 	return result, nil
 }
 
-func (s *Server) handleResourcesList(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handleResourcesList(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -567,7 +975,7 @@ func (s *Server) handleResourcesList(ctx context.Context, req *JSONRPCRequest) (
 	return map[string]interface{}{"resources": resources}, nil
 }
 
-func (s *Server) handleResourceRead(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handleResourceRead(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	var params struct {
 		URI string `json:"uri"`
 	}
@@ -592,7 +1000,7 @@ func (s *Server) handleResourceRead(ctx context.Context, req *JSONRPCRequest) (i
 	return content, nil
 }
 
-func (s *Server) handlePromptsList(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handlePromptsList(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -608,7 +1016,7 @@ func (s *Server) handlePromptsList(ctx context.Context, req *JSONRPCRequest) (in
 	return map[string]interface{}{"prompts": prompts}, nil
 }
 
-func (s *Server) handlePromptGet(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
+func (s *HTTPServer) handlePromptGet(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
 	var params struct {
 		Name      string            `json:"name"`
 		Arguments map[string]string `json:"arguments"`
@@ -635,70 +1043,31 @@ func (s *Server) handlePromptGet(ctx context.Context, req *JSONRPCRequest) (inte
 }
 
 // ============================================================================
-// Response Methods
-// ============================================================================
-
-func (s *Server) sendResult(id interface{}, result interface{}) {
-	resp := JSONRPCResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Result:  result,
-	}
-	s.sendResponse(resp)
-}
-
-func (s *Server) sendError(id interface{}, code int, message string, data interface{}) {
-	resp := JSONRPCResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &RPCError{
-			Code:    code,
-			Message: message,
-			Data:    data,
-		},
-	}
-	s.sendResponse(resp)
-}
-
-func (s *Server) sendResponse(resp JSONRPCResponse) {
-	data, err := json.Marshal(resp)
-	if err != nil {
-		s.config.Logger.Error("Failed to marshal response", "error", err)
-		return
-	}
-
-	s.writer.Write(data)
-	s.writer.WriteByte('\n')
-	s.writer.Flush()
-}
-
-// ============================================================================
 // Helper Types
 // ============================================================================
 
 type defaultLogger struct{}
 
 func (l *defaultLogger) Debug(msg string, args ...interface{}) {}
-func (l *defaultLogger) Info(msg string, args ...interface{})  {}
+func (l *defaultLogger) Info(msg string, args ...interface{}) {
+	fmt.Printf("INFO: %s %v\n", msg, args)
+}
 func (l *defaultLogger) Error(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "ERROR: %s %v\n", msg, args)
+	fmt.Fprintf(io.Discard, "ERROR: %s %v\n", msg, args)
 }
 
 // ============================================================================
 // Convenience Functions
 // ============================================================================
 
-// TextContent creates a text content object
 func TextContent(text string) Content {
 	return Content{Type: "text", Text: text}
 }
 
-// ImageContent creates an image content object
 func ImageContent(data string, mimeType string) Content {
 	return Content{Type: "image", Data: data, MimeType: mimeType}
 }
 
-// ErrorResponse creates an RPC error
 func ErrorResponse(code int, message string) error {
 	return &RPCError{Code: code, Message: message}
 }
