@@ -367,33 +367,6 @@ func matchPattern(pattern, origin string) bool {
 // HTTP Server Implementation
 // ============================================================================
 
-// HTTPServer represents an HTTP-based MCP server
-type HTTPServer struct {
-	config    HTTPServerConfig
-	tools     map[string]*Tool
-	resources map[string]*Resource
-	prompts   map[string]*Prompt
-
-	mu      sync.RWMutex
-	running bool
-	server  *http.Server
-
-	// Authentication
-	authProvider AuthProvider
-	whitelist    *URLWhitelist
-
-	// Hooks for lifecycle events
-	onInit     func(*InitializeParams) error
-	onShutdown func() error
-
-	// Middleware
-	middleware []Middleware
-
-	// Session management
-	sessions map[string]*Session
-	sessmu   sync.RWMutex
-}
-
 // HTTPServerConfig holds HTTP server configuration
 type HTTPServerConfig struct {
 	Name            string
@@ -445,6 +418,37 @@ type Middleware func(next HandlerFunc) HandlerFunc
 
 type HandlerFunc func(ctx context.Context, req *JSONRPCRequest) (interface{}, error)
 
+// HTTPServer represents an HTTP-based MCP server
+type HTTPServer struct {
+	config    HTTPServerConfig
+	tools     map[string]*Tool
+	resources map[string]*Resource
+	prompts   map[string]*Prompt
+
+	mu      sync.RWMutex
+	running bool
+	server  *http.Server
+
+	// Authentication
+	authProvider AuthProvider
+	whitelist    *URLWhitelist
+
+	// Hooks for lifecycle events
+	onInit     func(*InitializeParams) error
+	onShutdown func() error
+
+	// Middleware
+	middleware []Middleware
+
+	// Session management
+	sessions map[string]*Session
+	sessmu   sync.RWMutex
+
+	// Custom route handlers - NEW FIELD
+	customHandlers map[string]http.HandlerFunc
+	customMux      *http.ServeMux
+}
+
 // NewHTTPServer creates a new HTTP-based MCP server
 func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
 	if config.ProtocolVersion == "" {
@@ -467,13 +471,92 @@ func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
 	}
 
 	return &HTTPServer{
-		config:    config,
-		tools:     make(map[string]*Tool),
-		resources: make(map[string]*Resource),
-		prompts:   make(map[string]*Prompt),
-		sessions:  make(map[string]*Session),
-		whitelist: NewURLWhitelist(),
+		config:         config,
+		tools:          make(map[string]*Tool),
+		resources:      make(map[string]*Resource),
+		prompts:        make(map[string]*Prompt),
+		sessions:       make(map[string]*Session),
+		whitelist:      NewURLWhitelist(),
+		customHandlers: make(map[string]http.HandlerFunc), // NEW
+		customMux:      http.NewServeMux(),                // NEW
 	}
+}
+
+// HandleFunc registers a custom HTTP handler for a specific path - NEW METHOD
+func (s *HTTPServer) HandleFunc(pattern string, handler http.HandlerFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.customHandlers[pattern] = handler
+	s.customMux.HandleFunc(pattern, handler)
+}
+
+// Handle registers a custom HTTP handler for a specific path - NEW METHOD
+func (s *HTTPServer) Handle(pattern string, handler http.Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.customMux.Handle(pattern, handler)
+}
+
+// Start begins the HTTP server (UPDATED)
+func (s *HTTPServer) Start() error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("server already running")
+	}
+	s.running = true
+	s.mu.Unlock()
+
+	// Create the main mux that will route requests
+	mainMux := http.NewServeMux()
+
+	// Register custom handlers first (they take priority)
+	for pattern, handler := range s.customHandlers {
+		mainMux.HandleFunc(pattern, handler)
+	}
+
+	// Register MCP endpoint
+	mainMux.HandleFunc(s.config.Path, s.handleHTTPRequest)
+
+	// Register SSE endpoint for server-sent events (if needed)
+	mainMux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
+
+	// Health check endpoint
+	mainMux.HandleFunc("/health", s.handleHealth)
+
+	// Wrap with CORS if enabled
+	var handler http.Handler = mainMux
+	if s.config.EnableCORS {
+		handler = s.corsMiddleware(handler)
+	}
+
+	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	s.server = &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  s.config.ReadTimeout,
+		WriteTimeout: s.config.WriteTimeout,
+	}
+
+	s.config.Logger.Info("HTTP MCP Server started", "address", addr, "path", s.config.Path)
+
+	var err error
+	if s.config.TLSCert != "" && s.config.TLSKey != "" {
+		err = s.server.ListenAndServeTLS(s.config.TLSCert, s.config.TLSKey)
+	} else {
+		err = s.server.ListenAndServe()
+	}
+
+	if err != nil && err != http.ErrServerClosed {
+		return err
+	}
+
+	return nil
+}
+
+// GetMux returns the internal ServeMux for advanced routing needs - NEW METHOD
+func (s *HTTPServer) GetMux() *http.ServeMux {
+	return s.customMux
 }
 
 // SetAuthProvider sets the authentication provider
@@ -568,57 +651,6 @@ func (s *HTTPServer) OnShutdown(handler func() error) {
 // ============================================================================
 // HTTP Server Runtime
 // ============================================================================
-
-// Start begins the HTTP server
-func (s *HTTPServer) Start() error {
-	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
-		return fmt.Errorf("server already running")
-	}
-	s.running = true
-	s.mu.Unlock()
-
-	mux := http.NewServeMux()
-
-	// Register MCP endpoint
-	mux.HandleFunc(s.config.Path, s.handleHTTPRequest)
-
-	// Register SSE endpoint for server-sent events (if needed)
-	mux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
-
-	// Health check endpoint
-	mux.HandleFunc("/health", s.handleHealth)
-
-	// Wrap with CORS if enabled
-	var handler http.Handler = mux
-	if s.config.EnableCORS {
-		handler = s.corsMiddleware(handler)
-	}
-
-	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
-	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  s.config.ReadTimeout,
-		WriteTimeout: s.config.WriteTimeout,
-	}
-
-	s.config.Logger.Info("HTTP MCP Server started", "address", addr, "path", s.config.Path)
-
-	var err error
-	if s.config.TLSCert != "" && s.config.TLSKey != "" {
-		err = s.server.ListenAndServeTLS(s.config.TLSCert, s.config.TLSKey)
-	} else {
-		err = s.server.ListenAndServe()
-	}
-
-	if err != nil && err != http.ErrServerClosed {
-		return err
-	}
-
-	return nil
-}
 
 // Stop gracefully shuts down the server
 func (s *HTTPServer) Stop(ctx context.Context) error {
