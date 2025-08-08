@@ -441,54 +441,26 @@ type HTTPServer struct {
 	// Middleware
 	middleware []Middleware
 
-	// Session management
-	sessions map[string]*Session
-	sessmu   sync.RWMutex
-
-	// Custom route handlers - NEW FIELD
-	customHandlers map[string]http.HandlerFunc
-	customMux      *http.ServeMux
+	customMux *http.ServeMux
 }
 
 // NewHTTPServer creates a new HTTP-based MCP server
 func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
-	if config.ProtocolVersion == "" {
-		config.ProtocolVersion = "2025-06-18"
-	}
-	if config.Path == "" {
-		config.Path = "/mcp"
-	}
-	if config.Port == 0 {
-		config.Port = 3000
-	}
 	if config.Logger == nil {
 		config.Logger = &defaultLogger{}
 	}
-	if config.ReadTimeout == 0 {
-		config.ReadTimeout = 30 * time.Second
-	}
-	if config.WriteTimeout == 0 {
-		config.WriteTimeout = 30 * time.Second
-	}
-
 	return &HTTPServer{
-		config:         config,
-		tools:          make(map[string]*Tool),
-		resources:      make(map[string]*Resource),
-		prompts:        make(map[string]*Prompt),
-		sessions:       make(map[string]*Session),
-		whitelist:      NewURLWhitelist(),
-		customHandlers: make(map[string]http.HandlerFunc), // NEW
-		customMux:      http.NewServeMux(),                // NEW
+		config:    config,
+		customMux: http.NewServeMux(),
 	}
 }
 
-// HandleFunc registers a custom HTTP handler for a specific path - NEW METHOD
-func (s *HTTPServer) HandleFunc(pattern string, handler http.HandlerFunc) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.customHandlers[pattern] = handler
+func (s *HTTPServer) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
 	s.customMux.HandleFunc(pattern, handler)
+}
+
+func (s *HTTPServer) SetAuthProvider(provider AuthProvider) {
+	s.authProvider = provider
 }
 
 // Handle registers a custom HTTP handler for a specific path - NEW METHOD
@@ -509,16 +481,13 @@ func (s *HTTPServer) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
-	// Use customMux for all handlers
-	mux := s.customMux
-
-	// Always ensure MCP JSON-RPC handler is present
-	mux.HandleFunc(s.config.Path, s.handleHTTPRequest)
-	mux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
-	mux.HandleFunc("/health", s.handleHealth)
+	// Mount MCP handler to custom mux
+	s.customMux.HandleFunc(s.config.Path, s.handleHTTPRequest)
+	s.customMux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
+	s.customMux.HandleFunc("/health", s.handleHealth)
 
 	// Wrap with CORS if enabled
-	var handler http.Handler = mux
+	var handler http.Handler = s.customMux
 	if s.config.EnableCORS {
 		handler = s.corsMiddleware(handler)
 	}
@@ -542,11 +511,6 @@ func (s *HTTPServer) Start() error {
 // GetMux returns the internal ServeMux for advanced routing needs - NEW METHOD
 func (s *HTTPServer) GetMux() *http.ServeMux {
 	return s.customMux
-}
-
-// SetAuthProvider sets the authentication provider
-func (s *HTTPServer) SetAuthProvider(provider AuthProvider) {
-	s.authProvider = provider
 }
 
 // SetURLWhitelist sets the URL whitelist
@@ -663,11 +627,9 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 
 // --- MCP HTTP request handler ---
 func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
-	// Auth check
 	if s.authProvider != nil {
 		authenticated, err := s.authProvider.Authenticate(r)
 		if err != nil {
-			s.config.Logger.Error("Authentication error", "error", err)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"jsonrpc": "2.0",
@@ -691,7 +653,6 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// OPTIONS preflight
 	if r.Method == "OPTIONS" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -699,7 +660,6 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Non-POST requests → JSON error, not plain text
 	if r.Method != "POST" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -712,7 +672,6 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		s.config.Logger.Error("Failed to read request body", "error", err)
@@ -721,23 +680,10 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Batch requests
-	if len(body) > 0 && body[0] == '[' {
-		s.handleBatchRequest(w, r, body)
-		return
-	}
-
-	// Single request
 	var req JSONRPCRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		s.config.Logger.Error("Failed to parse request", "error", err)
 		s.sendHTTPError(w, nil, -32700, "Parse error", nil)
-		return
-	}
-
-	// Notifications (no ID)
-	if req.ID == nil {
-		w.WriteHeader(http.StatusOK)
 		return
 	}
 
