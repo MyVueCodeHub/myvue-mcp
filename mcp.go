@@ -499,6 +499,7 @@ func (s *HTTPServer) Handle(pattern string, handler http.Handler) {
 }
 
 // Start begins the HTTP server (UPDATED)
+// in mcp.go -> Start()
 func (s *HTTPServer) Start() error {
 	s.mu.Lock()
 	if s.running {
@@ -508,25 +509,16 @@ func (s *HTTPServer) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
-	// Create the main mux that will route requests
-	mainMux := http.NewServeMux()
+	// Use customMux for all handlers
+	mux := s.customMux
 
-	// Register custom handlers first (they take priority)
-	for pattern, handler := range s.customHandlers {
-		mainMux.HandleFunc(pattern, handler)
-	}
-
-	// Register MCP endpoint
-	mainMux.HandleFunc(s.config.Path, s.handleHTTPRequest)
-
-	// Register SSE endpoint for server-sent events (if needed)
-	mainMux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
-
-	// Health check endpoint
-	mainMux.HandleFunc("/health", s.handleHealth)
+	// Always ensure MCP JSON-RPC handler is present
+	mux.HandleFunc(s.config.Path, s.handleHTTPRequest)
+	mux.HandleFunc(s.config.Path+"/sse", s.handleSSE)
+	mux.HandleFunc("/health", s.handleHealth)
 
 	// Wrap with CORS if enabled
-	var handler http.Handler = mainMux
+	var handler http.Handler = mux
 	if s.config.EnableCORS {
 		handler = s.corsMiddleware(handler)
 	}
@@ -541,18 +533,10 @@ func (s *HTTPServer) Start() error {
 
 	s.config.Logger.Info("HTTP MCP Server started", "address", addr, "path", s.config.Path)
 
-	var err error
 	if s.config.TLSCert != "" && s.config.TLSKey != "" {
-		err = s.server.ListenAndServeTLS(s.config.TLSCert, s.config.TLSKey)
-	} else {
-		err = s.server.ListenAndServe()
+		return s.server.ListenAndServeTLS(s.config.TLSCert, s.config.TLSKey)
 	}
-
-	if err != nil && err != http.ErrServerClosed {
-		return err
-	}
-
-	return nil
+	return s.server.ListenAndServe()
 }
 
 // GetMux returns the internal ServeMux for advanced routing needs - NEW METHOD
