@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -1105,7 +1106,7 @@ type defaultLogger struct{}
 
 func (l *defaultLogger) Debug(msg string, args ...interface{}) {}
 func (l *defaultLogger) Info(msg string, args ...interface{}) {
-	fmt.Printf("INFO: %s %v\n", msg, args)
+	fmt.Fprintf(os.Stderr, "INFO: %s %v\n", msg, args)
 }
 func (l *defaultLogger) Error(msg string, args ...interface{}) {
 	fmt.Fprintf(io.Discard, "ERROR: %s %v\n", msg, args)
