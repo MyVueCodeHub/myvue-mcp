@@ -689,29 +689,37 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !authenticated {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	// Check URL whitelist if configured
-	origin := r.Header.Get("Origin")
-	if origin != "" && s.whitelist != nil && len(s.whitelist.allowedOrigins) > 0 {
-		if !s.whitelist.IsAllowed(origin) {
-			http.Error(w, "Origin not allowed", http.StatusForbidden)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"error": map[string]interface{}{
+					"code":    -32600,
+					"message": "Unauthorized",
+				},
+			})
 			return
 		}
 	}
 
 	// Handle preflight requests
 	if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	// Only accept POST requests for JSON-RPC
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"error": map[string]interface{}{
+				"code":    -32600,
+				"message": "Only POST supported on this endpoint",
+			},
+		})
 		return
 	}
 
@@ -738,30 +746,14 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ===== IMPORTANT FIX: Handle notifications properly =====
-	// Notifications are JSON-RPC messages without an ID
-	// They should not receive a response according to the spec
+	// Handle notifications
 	if req.ID == nil {
-		s.config.Logger.Info("Received notification", "method", req.Method)
-
-		// Handle specific notifications
-		switch req.Method {
-		case "notifications/initialized":
-			// Client is confirming initialization is complete
-			s.config.Logger.Info("Client initialization complete")
-		default:
-			s.config.Logger.Info("Unknown notification", "method", req.Method)
-		}
-
-		// For notifications, we just return 200 OK with no body
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	// ===== END OF FIX =====
 
 	ctx := r.Context()
 
-	// Add principal to context if authenticated
 	if s.authProvider != nil {
 		if principal, err := s.authProvider.GetPrincipal(r); err == nil {
 			ctx = context.WithValue(ctx, "principal", principal)
@@ -770,12 +762,10 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 
 	result, rpcErr := s.handleRequest(ctx, &req)
 
-	// Send response
 	resp := JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      req.ID,
 	}
-
 	if rpcErr != nil {
 		resp.Error = rpcErr
 	} else {
