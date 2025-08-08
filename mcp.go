@@ -731,17 +731,17 @@ func (s *HTTPServer) getHandler(method string) HandlerFunc {
 	switch method {
 	case "initialize":
 		return s.handleInitialize
-	case "tools/list":
+	case "/tools/list":
 		return s.handleToolsList
-	case "tools/call":
+	case "/tools/call":
 		return s.handleToolCall
-	case "resources/list":
+	case "/resources/list":
 		return s.handleResourcesList
-	case "resources/read":
+	case "/resources/read":
 		return s.handleResourceRead
-	case "prompts/list":
+	case "/prompts/list":
 		return s.handlePromptsList
-	case "prompts/get":
+	case "/prompts/get":
 		return s.handlePromptGet
 	default:
 		return func(ctx context.Context, req *JSONRPCRequest) (interface{}, error) {
