@@ -632,11 +632,42 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 
 // --- MCP HTTP request handler ---
 func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	// Always set CORS headers here too in case middleware is bypassed
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
+	// Optional: allow GET for health/info
+	if r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"mcp": "ready"})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"error": map[string]interface{}{
+				"code":    -32600,
+				"message": "Only POST supported on this endpoint",
+			},
+		})
+		return
+	}
+
 	if s.authProvider != nil {
 		authenticated, err := s.authProvider.Authenticate(r)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"error": map[string]interface{}{
 					"code":    -32603,
@@ -647,7 +678,7 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		if !authenticated {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"error": map[string]interface{}{
 					"code":    -32600,
@@ -656,25 +687,6 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-	}
-
-	if r.Method == "OPTIONS" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	}
-
-	if r.Method != "POST" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"jsonrpc": "2.0",
-			"error": map[string]interface{}{
-				"code":    -32600,
-				"message": "Only POST supported on this endpoint",
-			},
-		})
-		return
 	}
 
 	body, err := io.ReadAll(r.Body)
@@ -712,7 +724,7 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *HTTPServer) handleBatchRequest(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -792,33 +804,15 @@ func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers
-		if len(s.config.AllowedOrigins) > 0 {
-			origin := r.Header.Get("Origin")
-			for _, allowed := range s.config.AllowedOrigins {
-				if allowed == "*" || allowed == origin {
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					break
-				}
-			}
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-		if len(s.config.AllowedMethods) > 0 {
-			w.Header().Set("Access-Control-Allow-Methods", strings.Join(s.config.AllowedMethods, ", "))
-		} else {
-			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		}
-
-		if len(s.config.AllowedHeaders) > 0 {
-			w.Header().Set("Access-Control-Allow-Headers", strings.Join(s.config.AllowedHeaders, ", "))
-		} else {
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		}
-
-		if s.config.AllowCredentials {
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
 		}
 
 		next.ServeHTTP(w, r)
