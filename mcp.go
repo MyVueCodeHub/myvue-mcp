@@ -944,6 +944,156 @@ func (s *HTTPServer) EnableRESTAPI(enable bool) {
 	})
 }
 
+// RegisterTool registers a tool with full control over the input schema
+func (s *HTTPServer) RegisterTool(name, description string, schema InputSchema, handler ToolHandler) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.tools[name]; exists {
+		return fmt.Errorf("tool %s already registered", name)
+	}
+
+	s.tools[name] = &Tool{
+		Name:        name,
+		Description: description,
+		InputSchema: schema,
+		handler:     handler,
+	}
+
+	s.config.Logger.Info("Tool registered", "name", name)
+	return nil
+}
+
+// RegisterSimpleTool registers a tool with a simple handler (no input schema validation)
+func (s *HTTPServer) RegisterSimpleTool(name, description string, handler ToolHandler) error {
+	// Create a simple schema that accepts any object
+	schema := InputSchema{
+		Type:       "object",
+		Properties: map[string]Property{},
+	}
+
+	return s.RegisterTool(name, description, schema, handler)
+}
+
+// RegisterResource registers a resource handler
+func (s *HTTPServer) RegisterResource(uri, name, description, mimeType string, handler ResourceHandler) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.resources[uri]; exists {
+		return fmt.Errorf("resource %s already registered", uri)
+	}
+
+	s.resources[uri] = &Resource{
+		URI:         uri,
+		Name:        name,
+		Description: description,
+		MimeType:    mimeType,
+		handler:     handler,
+	}
+
+	s.config.Logger.Info("Resource registered", "uri", uri)
+	return nil
+}
+
+// RegisterPrompt registers a prompt handler
+func (s *HTTPServer) RegisterPrompt(name, description string, args []PromptArg, handler PromptHandler) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.prompts[name]; exists {
+		return fmt.Errorf("prompt %s already registered", name)
+	}
+
+	s.prompts[name] = &Prompt{
+		Name:        name,
+		Description: description,
+		Arguments:   args,
+		handler:     handler,
+	}
+
+	s.config.Logger.Info("Prompt registered", "name", name)
+	return nil
+}
+
+// UnregisterTool removes a tool from the server
+func (s *HTTPServer) UnregisterTool(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.tools[name]; !exists {
+		return fmt.Errorf("tool %s not found", name)
+	}
+
+	delete(s.tools, name)
+	s.config.Logger.Info("Tool unregistered", "name", name)
+	return nil
+}
+
+// UnregisterResource removes a resource from the server
+func (s *HTTPServer) UnregisterResource(uri string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.resources[uri]; !exists {
+		return fmt.Errorf("resource %s not found", uri)
+	}
+
+	delete(s.resources, uri)
+	s.config.Logger.Info("Resource unregistered", "uri", uri)
+	return nil
+}
+
+// UnregisterPrompt removes a prompt from the server
+func (s *HTTPServer) UnregisterPrompt(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.prompts[name]; !exists {
+		return fmt.Errorf("prompt %s not found", name)
+	}
+
+	delete(s.prompts, name)
+	s.config.Logger.Info("Prompt unregistered", "name", name)
+	return nil
+}
+
+// GetTools returns a list of registered tool names
+func (s *HTTPServer) GetTools() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	names := make([]string, 0, len(s.tools))
+	for name := range s.tools {
+		names = append(names, name)
+	}
+	return names
+}
+
+// GetResources returns a list of registered resource URIs
+func (s *HTTPServer) GetResources() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	uris := make([]string, 0, len(s.resources))
+	for uri := range s.resources {
+		uris = append(uris, uri)
+	}
+	return uris
+}
+
+// GetPrompts returns a list of registered prompt names
+func (s *HTTPServer) GetPrompts() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	names := make([]string, 0, len(s.prompts))
+	for name := range s.prompts {
+		names = append(names, name)
+	}
+	return names
+}
+
 // ----------------------------- Convenience ---------------------------------
 
 func TextContent(text string) Content {
