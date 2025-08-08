@@ -886,6 +886,64 @@ func (s *HTTPServer) handlePromptGet(ctx context.Context, req *JSONRPCRequest) (
 	return result, nil
 }
 
+func (s *HTTPServer) EnableRESTAPI(enable bool) {
+	if !enable {
+		return
+	}
+	// List all tools
+	s.customMux.HandleFunc("/api/tools", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		tools := make([]map[string]interface{}, 0, len(s.tools))
+		for name, tool := range s.tools {
+			tools = append(tools, map[string]interface{}{
+				"name":        name,
+				"description": tool.Description,
+				"inputSchema": tool.InputSchema,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"tools": tools,
+		})
+	})
+
+	// Run a tool
+	s.customMux.HandleFunc("/api/tool/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		toolName := strings.TrimPrefix(r.URL.Path, "/api/tool/")
+		tool, ok := s.tools[toolName]
+		if !ok {
+			http.Error(w, "Tool not found", http.StatusNotFound)
+			return
+		}
+
+		// Parse JSON body into params map
+		var params map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		// Run the tool handler directly
+		result, err := tool.handler(r.Context(), params)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": result,
+		})
+	})
+}
+
 // ----------------------------- Convenience ---------------------------------
 
 func TextContent(text string) Content {
