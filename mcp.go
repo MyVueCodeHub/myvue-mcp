@@ -677,15 +677,21 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 // HTTP Request Handling
 // ============================================================================
 
-// Replace your handleHTTPRequest method in mcp.go with this version:
-
+// --- MCP HTTP request handler ---
 func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
-	// Check authentication if configured
+	// Auth check
 	if s.authProvider != nil {
 		authenticated, err := s.authProvider.Authenticate(r)
 		if err != nil {
 			s.config.Logger.Error("Authentication error", "error", err)
-			http.Error(w, "Authentication error", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"error": map[string]interface{}{
+					"code":    -32603,
+					"message": "Authentication error",
+				},
+			})
 			return
 		}
 		if !authenticated {
@@ -701,16 +707,15 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Handle preflight requests
+	// OPTIONS preflight
 	if r.Method == "OPTIONS" {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return
 	}
 
-	// Only accept POST requests for JSON-RPC
+	// Non-POST requests → JSON error, not plain text
 	if r.Method != "POST" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -723,7 +728,7 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request body
+	// Parse body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		s.config.Logger.Error("Failed to read request body", "error", err)
@@ -732,13 +737,13 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Handle batch requests
+	// Batch requests
 	if len(body) > 0 && body[0] == '[' {
 		s.handleBatchRequest(w, r, body)
 		return
 	}
 
-	// Handle single request
+	// Single request
 	var req JSONRPCRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		s.config.Logger.Error("Failed to parse request", "error", err)
@@ -746,14 +751,13 @@ func (s *HTTPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle notifications
+	// Notifications (no ID)
 	if req.ID == nil {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	ctx := r.Context()
-
 	if s.authProvider != nil {
 		if principal, err := s.authProvider.GetPrincipal(r); err == nil {
 			ctx = context.WithValue(ctx, "principal", principal)
