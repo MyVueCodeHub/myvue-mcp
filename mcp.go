@@ -548,7 +548,7 @@ func (s *HTTPServer) RegisterTool(name, description string, schema InputSchema, 
 func (s *HTTPServer) RegisterSimpleTool(name, description string, handler ToolHandler) error {
 	schema := InputSchema{
 		Type:       "object",
-		Properties: map[string]Property{},
+		Properties: make(map[string]Property),
 	}
 	return s.RegisterTool(name, description, schema, handler)
 }
