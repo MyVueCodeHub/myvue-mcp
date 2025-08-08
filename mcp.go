@@ -452,6 +452,11 @@ func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
 	return &HTTPServer{
 		config:    config,
 		customMux: http.NewServeMux(),
+
+		// FIX: initialize maps to avoid nil map assignment panic
+		tools:     make(map[string]*Tool),
+		resources: make(map[string]*Resource),
+		prompts:   make(map[string]*Prompt),
 	}
 }
 
